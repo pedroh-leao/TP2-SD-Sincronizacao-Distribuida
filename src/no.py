@@ -9,7 +9,7 @@ import sys
 maximo_inteiro = sys.maxsize
 
 class No:
-    def __init__(self, id_no, num_de_nos, host, porta_cliente, porta_no_atual, proximo_host, proxima_porta_no) -> None:
+    def __init__(self, id_no, num_de_nos, host, porta_cliente, porta_no_atual, proximo_host, proxima_porta_no, proximo_host_backup, proxima_porta_no_backup) -> None:
         self.id_no = id_no
         self.num_de_nos = num_de_nos
         self.host = host
@@ -17,6 +17,8 @@ class No:
         self.porta_no_atual = porta_no_atual # Porta com a qual o no anterior vai se conectar
         self.proximo_host = proximo_host
         self.proxima_porta_no = proxima_porta_no
+        self.proximo_host_backup = proximo_host_backup              # tolerancia a falha
+        self.proxima_porta_no_backup = proxima_porta_no_backup      # tolerancia a falha
 
         self.timestamp_cliente = None
         self.token = [None] * num_de_nos  # Inicializa o vetor vazio
@@ -28,6 +30,8 @@ class No:
         self.cliente_socket     = socket.socket(socket.AF_INET, socket.SOCK_STREAM) # Escuta e fala
         self.no_anterior_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM) # Somente escuta
         self.no_seguinte_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM) # Somente fala
+        self.no_anterior_socket_backup = socket.socket(socket.AF_INET, socket.SOCK_STREAM) # Somente escuta
+        self.no_seguinte_socket_backup = socket.socket(socket.AF_INET, socket.SOCK_STREAM) # Somente fala
 
         self.esperar_resposta = threading.Event()
         self.mutex = threading.Lock()
@@ -60,16 +64,24 @@ class No:
 
                 conn.sendall(json.dumps({"status": "commited"}).encode())                    
 
-    # Inicia a conexao com o no seguinte do anel
+    # Inicia a conexao com o no seguinte do anel e o de backup
     def conectar_ao_no_seguinte(self):
         self.no_seguinte_socket.connect(
             (self.proximo_host, self.proxima_porta_no)
         )
+        self.no_seguinte_socket_backup(
+            (self.proximo_host_backup, self.proxima_porta_no_backup)
+        )
+
 
     # Realiza o bind para permitir que o no anterior possa se conectar
     def bind_para_no_anterior(self):
+        # Principal
         self.no_anterior_socket.bind((self.host, self.porta_no_atual))
         self.no_anterior_socket.listen()
+        #Backup
+        self.no_anterior_socket_backup.bind((self.host, self.porta_no_atual))
+        self.no_anterior_socket_backup.listen()
 
     # Escreve no token o timestamp do cliente, caso tenha informacoes, ou nulo, caso contrario
     def escrever_no_token(self):
@@ -77,12 +89,21 @@ class No:
         # Exibindo na tela caso o novo valor para exibir seja diferente do anterior
         exibir = f"Nó {self.id_no} - Estado atual do vetor de tokens: {self.token}"
         if exibir != self.print_na_tela: 
-            print(exibir)
+            #print(exibir)
             self.print_na_tela = exibir
 
-    # Envia o token para o proximo no do anel
+    # Tenta enviar o token para o proximo no do anel, se nao conseguir, envia para o backup
+    # * AQUI FICA A LOGICA DO 1.1 E DO 1.2, ELAS ESTAO JUNTAS
     def enviar_para_proximo(self, vetor):
-        self.no_seguinte_socket.sendall(json.dumps(vetor).encode())
+        try:
+            self.no_seguinte_socket.sendall(json.dumps(vetor).encode())
+
+        except ConnectionAbortedError:
+            self.no_seguinte_socket = self.no_seguinte_socket_backup
+            # O no da frente nao tera mais dados uma vez que ele caiu
+            vetor[(self.id_no + 1) % self.num_de_nos] = None
+            print(f"Nó {(self.id_no + 1) % self.num_de_nos} está fora do ar")
+            self.enviar_para_proximo(vetor)
 
     # Fica esperando o no anterior enviar o token e atualiza o local com os novos valores
     def esperar_token(self):       
@@ -90,13 +111,43 @@ class No:
             self.conn_anterior, _ = self.no_anterior_socket.accept()
             self.noAnteriorConectado = True
 
+        # Tenta receber o token de B
         try:
             dados = self.conn_anterior.recv(BUFFER_SIZE)
             if dados:
                 token = json.loads(dados.decode())
                 self.token = token
+                if hasattr(self, 'temporizador'):  # Se houver um temporizador, ele deve ser cancelado ao receber de B
+                    self.temporizador.cancel()
+
         except OSError as e:
-            print(f"Erro ao receber dados: {e}")
+            print(f"Erro ao receber dados de {(self.id_no - 1) % self.num_de_nos}: {e}")
+
+        # Verifica se A enviou um token pelo backup
+        try:
+            conn_anterior_backup, _ = self.no_anterior_socket_backup.accept()
+            dados_backup = conn_anterior_backup.recv(BUFFER_SIZE)
+            if dados_backup:
+                token_backup = json.loads(dados_backup.decode())
+                # Se o temporizador não foi cancelado, quer dizer que B falhou, então aceita o token de A
+                if self.temporizador.is_alive():
+                    print(f"Nó {self.id_no} recebeu token de  via backup")
+                    self.token = token_backup
+                    self.iniciar_temporizador()  # Inicia o temporizador para a próxima rodada
+        except OSError as e:
+            print(f"Erro ao receber dados de {(self.id_no - 2) % self.num_de_nos}: {e}")
+
+
+    # Inicia um temporizador de 5 segundos para verificar se o anterior falhou
+    def iniciar_temporizador(self):
+        self.temporizador = threading.Timer(5.0, self.deteccao_de_falha)
+        self.temporizador.start()
+
+    def deteccao_de_falha(self):
+        print(f"Falha detectada no nó {(self.id_no - 1) % self.num_de_nos}. Nó {self.id_no} agora está recebendo diretamente de {(self.id_no - 2) % self.num_de_nos}.")
+        # Quando o temporizador expira, muda a comunicação para o backup
+        self.no_anterior_socket = self.no_anterior_socket_backup
+
 
 
     # Verifica se pode ou nao acessar a regiao critica
@@ -125,26 +176,29 @@ class No:
 
     def executar_no(self):
         self.bind_para_no_anterior()
-        # Garantindo que o nó anterior já realizou o bind e eu consigo conectar, uma vez que o compose nao garante a inicializacao sequencial
         time.sleep(2)
         self.conectar_ao_no_seguinte()
 
-        # O primeiro no inicia o processo de escrever no vetor (token) vazio do anel e passar ao proximo no
         if self.id_no == 0:
-            self.escrever_no_token() # Escreve no vetor
+            self.escrever_no_token()
             self.enviar_para_proximo(self.token)
 
         while True:
-            self.esperar_token() # Espera o vetor (token) do no anterior
+            self.esperar_token() 
 
             if self.verificar_regiao_critica():
                 self.entrar_regiao_critica()
                 self.sair_da_regiao_critica()
 
             else:
-                self.escrever_no_token() # Escreve no vetor
-            
-            self.enviar_para_proximo(self.token) # Envia o vetor para o proximo no
+                self.escrever_no_token()
+
+            self.enviar_para_proximo(self.token)
+
+            # Iniciar o temporizador quando o token for recebido via socket de backup
+            if self.no_anterior_socket == self.no_anterior_socket_backup:
+                self.iniciar_temporizador()
+
 
 
 if __name__ == "__main__":
